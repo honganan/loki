@@ -77,8 +77,7 @@ type FifoCache struct {
 	entries map[string]*list.Element
 	lru     *list.List
 
-	done   chan struct{}
-	ticker *time.Ticker
+	done chan struct{}
 
 	entriesAdded    prometheus.Counter
 	entriesAddedNew prometheus.Counter
@@ -131,8 +130,7 @@ func NewFifoCache(name string, cfg FifoCacheConfig, reg prometheus.Registerer, l
 		entries:      make(map[string]*list.Element),
 		lru:          list.New(),
 
-		done:   make(chan struct{}),
-		ticker: time.NewTicker(cfg.PurgeInterval),
+		done: make(chan struct{}),
 
 		entriesAdded: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Namespace:   "querier",
@@ -200,21 +198,24 @@ func NewFifoCache(name string, cfg FifoCacheConfig, reg prometheus.Registerer, l
 	}
 
 	if cfg.TTL > 0 {
-		go runPruneJob(cache, cfg.TTL)
+		go cache.runPruneJob(cfg.PurgeInterval, cfg.TTL)
 	}
 
 	return cache
 }
 
-func runPruneJob(c *FifoCache, ttl time.Duration) {
+func (c *FifoCache) runPruneJob(interval, ttl time.Duration) {
+	ticker := time.NewTicker(interval)
+OUTER:
 	for {
 		select {
 		case <-c.done:
-			return
-		case t := <-c.ticker.C:
+			break OUTER
+		case t := <-ticker.C:
 			c.pruneExpiredItems(t, ttl)
 		}
 	}
+	ticker.Stop()
 }
 
 // pruneExpiredItems prunes items in the cache that exceeded their ttl
@@ -269,7 +270,6 @@ func (c *FifoCache) Stop() {
 	defer c.lock.Unlock()
 
 	close(c.done)
-	c.ticker.Stop()
 
 	c.entriesEvicted.Add(float64(c.lru.Len()))
 
