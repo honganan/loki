@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,9 +16,14 @@ import (
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/tenant"
 	"github.com/grafana/dskit/user"
+	"github.com/grafana/loki/v3/pkg/bbf"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/storage/config"
+	"github.com/grafana/loki/v3/pkg/util/encoding"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"golang.org/x/exp/slices"
 	"golang.org/x/net/context"
 	"golang.org/x/time/rate"
 
@@ -427,6 +433,7 @@ func (i *Ingester) flushChunks(ctx context.Context, fp model.Fingerprint, labelP
 	sizePerTenant := i.metrics.chunkSizePerTenant.WithLabelValues(userID)
 	countPerTenant := i.metrics.chunksPerTenant.WithLabelValues(userID)
 
+	refs := make([]logproto.ChunkRef, 0, len(cs))
 	for j, c := range cs {
 		if err := i.closeChunk(c, chunkMtx); err != nil {
 			return fmt.Errorf("chunk close for flushing: %w", err)
@@ -449,6 +456,8 @@ func (i *Ingester) flushChunks(ctx context.Context, fp model.Fingerprint, labelP
 			return err
 		}
 
+		refs = append(refs, ch.ChunkRef)
+
 		reason := func() string {
 			chunkMtx.Lock()
 			defer chunkMtx.Unlock()
@@ -460,7 +469,116 @@ func (i *Ingester) flushChunks(ctx context.Context, fp model.Fingerprint, labelP
 		i.markChunkAsFlushed(cs[j], chunkMtx)
 	}
 
+	if _, ok := i.bbfConfig.EnabledTenantsMap[userID]; ok {
+		background := user.InjectOrgID(context.Background(), userID)
+		ctxWithTimeOut, _ := context.WithTimeout(background, 10*time.Minute)
+		go i.writeToBloomWithRetries(ctxWithTimeOut, refs, labelPairs)
+	}
 	return nil
+}
+
+func (i *Ingester) writeToBloomWithRetries(ctx context.Context, refs []logproto.ChunkRef, labelPairs labels.Labels) {
+	cfg := backoff.Config{
+		MinBackoff: 2 * time.Second,
+		MaxBackoff: 10 * time.Second,
+		MaxRetries: 0,
+	}
+	retries := backoff.New(ctx, cfg)
+	for retries.Ongoing() {
+
+		err := i.writeChunkRefsToBloom(ctx, refs, labelPairs)
+		if err == nil {
+			return
+		}
+
+		level.Warn(util_log.Logger).Log("msg", "error writing tokens to BBF computer, will retry it", "err", err, "retry", retries.NumRetries())
+		retries.Wait()
+	}
+	return
+}
+
+func (i *Ingester) writeChunkRefsToBloom(ctx context.Context, refs []logproto.ChunkRef, labelPairs labels.Labels) error {
+	if len(refs) == 0 {
+		return nil
+	}
+
+	s := config.SchemaConfig{
+		Configs: i.periodicConfigs,
+	}
+	// build Request for each Computer
+	rs, err := i.computerRing.Ring.GetAllHealthy(ring.Read)
+	if err != nil {
+		level.Error(i.logger).Log("msg", "failed to get all healthy bloom computers", "err", err)
+		return err
+	}
+	if len(rs.Instances) == 0 {
+		level.Error(i.logger).Log("msg", "no bloom computer registered")
+		return errors.New("no bloom computer registered")
+	}
+
+	computers := rs.Instances
+	slices.SortFunc(computers, func(i, j ring.InstanceDesc) int {
+		return strings.Compare(i.Addr, j.Addr)
+	})
+
+	// 先对 refs 按 day time 分组一下
+	group := make(map[config.DayTime][]*logproto.ChunkRef, 1)
+	for _, ref := range refs {
+		dayTime := config.NewDayTime(ref.Through)
+		group[dayTime] = append(group[dayTime], &ref)
+	}
+	reqs := make(map[string]bbf.ComputeRequest, len(computers))
+	for day, g := range group {
+		schema, err := s.SchemaForTime(day.Time)
+		if err != nil {
+			level.Error(i.logger).Log("msg", "failed to get schema for time", "err", err)
+			return err
+		}
+		if !MatchBloomStreams(schema, labelPairs) {
+			continue
+		}
+
+		for _, ref := range g {
+			id := s.ExternalKey(*ref)
+			idx := encoding.XxhashHashIndex([]byte(id), len(computers))
+
+			req, ok := reqs[computers[idx].Addr]
+			if !ok {
+				req = bbf.ComputeRequest{
+					Refs: make([]*logproto.ChunkRef, 0, 10),
+				}
+				req.Refs = append(req.Refs, ref)
+				reqs[computers[idx].Addr] = req
+			}
+			req.Refs = append(req.Refs, ref)
+		}
+	}
+
+	level.Debug(i.logger).Log("msg", "write chunk refs to bloom", "reqs", reqs)
+	// 写入 bloom computer
+	for addr, req := range reqs {
+		client, err := i.bbfComputerClient.GetClientFor(addr)
+		if err != nil {
+			level.Error(i.logger).Log("msg", "failed to get BBFComputerClient for addr", "err", err)
+			return err
+		}
+		_, err = client.(bbf.BBFComputerClient).Compute(ctx, &req)
+		if err != nil {
+			level.Error(i.logger).Log("msg", "failed to write to bloom computer", "err", err)
+			return err
+		}
+		level.Debug(i.logger).Log("msg", "success to write chunk refs to bloom computer", "addr", addr, "refs", len(req.Refs))
+	}
+	return nil
+}
+
+func MatchBloomStreams(schema config.PeriodConfig, labelPairs labels.Labels) bool {
+	for _, _stream := range schema.BBFStreams {
+		if labels.Selector(_stream.Matchers).Matches(labelPairs) {
+			return true
+		}
+	}
+	return false
 }
 
 // markChunkAsFlushed mark a chunk to make sure it won't be flushed if this operation fails.

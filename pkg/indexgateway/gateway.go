@@ -13,6 +13,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/tenant"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
@@ -256,10 +257,9 @@ func (g *Gateway) GetChunkRef(ctx context.Context, req *logproto.GetChunkRefRequ
 		return result, nil
 	}
 
-	// Extract testable LabelFilters from the plan. If there is none, we can
-	// short-circuit and return before making a req to the bloom-gateway (through
-	// the g.bloomQuerier)
-	if len(v1.ExtractTestableLabelMatchers(req.Plan.AST)) == 0 {
+	// Extract LineFiltersExpr from the plan. If there is none, we can short-circuit and return before making a req
+	// to the bloom-gateway (through the g.bloomQuerier)
+	if len(syntax.ExtractLineFilters(req.Plan.AST)) == 0 {
 		return result, nil
 	}
 
@@ -279,14 +279,15 @@ func (g *Gateway) GetChunkRef(ctx context.Context, req *logproto.GetChunkRefRequ
 	start = time.Now()
 	chunkRefs, used, err := g.bloomQuerier.FilterChunkRefs(ctx, instanceID, req.From, req.Through, seriesMap, result.Refs, req.Plan)
 	if err != nil {
-		return nil, err
+		level.Error(g.log).Log("msg", "error filtering chunk refs", "err", err)
+		return result, err
 	}
 	sp.AddEvent("bloomQuerier.FilterChunkRefs", trace.WithAttributes(
 		attribute.String("duration", time.Since(start).String()),
 	))
 
 	result.Refs = chunkRefs
-	level.Info(logger).Log("msg", "return filtered chunk refs", "unfiltered", initialChunkCount, "filtered", len(result.Refs), "used_blooms", used)
+	level.Info(logger).Log("msg", "return filtered chunk refs", "unfiltered", initialChunkCount, "filtered", len(result.Refs), "used_blooms", "from", req.From, "through", req.Through, used)
 	result.Stats.PostFilterChunks = int64(len(result.Refs))
 	result.Stats.UsedBloomFilters = used
 	return result, nil
@@ -492,26 +493,28 @@ func (g *Gateway) boundedShards(
 	filtered := refs
 
 	// 2) filter via blooms if enabled
-	filters := v1.ExtractTestableLabelMatchers(p.Plan().AST)
-	// NOTE(chaudum): Temporarily disable bloom filtering of chunk refs,
-	// as this doubles the load on bloom gateways.
-	// if g.bloomQuerier != nil && len(filters) > 0 {
-	// 	xs, err := g.bloomQuerier.FilterChunkRefs(ctx, instanceID, req.From, req.Through, refs, p.Plan())
-	// 	if err != nil {
-	// 		level.Error(logger).Log("msg", "failed to filter chunk refs", "err", err)
-	// 	} else {
-	// 		filtered = xs
-	// 	}
-	// 	sp.LogKV(
-	// 		"stage", "queried bloom gateway",
-	// 		"err", err,
-	// 	)
-	// }
+	filters := syntax.ExtractLineFilters(p.Plan().AST)
+	if g.bloomQuerier != nil && len(filters) > 0 {
+		filtered, _, err = g.bloomQuerier.FilterChunkRefs(ctx, instanceID, req.From, req.Through, nil, refs, p.Plan())
+		if err != nil {
+			return err
+		}
+		sp.AddEvent("queried bloom gateway")
+	}
 
 	g.metrics.preFilterChunks.WithLabelValues(routeShards).Observe(float64(ct))
 	g.metrics.postFilterChunks.WithLabelValues(routeShards).Observe(float64(len(filtered)))
 
-	resp := &logproto.ShardsResponse{}
+	statistics := stats.Result{
+		Index: stats.Index{
+			TotalChunks:      int64(ct),
+			PostFilterChunks: int64(len(filtered)),
+		},
+	}
+
+	resp := &logproto.ShardsResponse{
+		Statistics: statistics,
+	}
 
 	// Edge case: if there are no chunks after filtering, we still need to return a single shard
 	if len(filtered) == 0 {
@@ -548,8 +551,8 @@ func (g *Gateway) boundedShards(
 	ms := syntax.MatchersExpr{Mts: p.Matchers}
 	level.Debug(logger).Log(
 		"msg", "send shards response",
-		"total_chunks", ct,
-		"post_filter_chunks", len(filtered),
+		"total_chunks", statistics.Index.TotalChunks,
+		"post_filter_chunks", statistics.Index.PostFilterChunks,
 		"shards", len(resp.Shards),
 		"query", req.Query,
 		"target_bytes_per_shard", datasize.ByteSize(req.TargetBytesPerShard).HumanReadable(),

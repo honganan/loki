@@ -14,6 +14,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/grafana/loki/v3/pkg/bbf"
+	"github.com/grafana/loki/v3/pkg/loghttp/push"
+	lokilog "github.com/grafana/loki/v3/pkg/logql/log"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/metadata"
+	"github.com/grafana/loki/v3/pkg/storage/types"
+	lokiring "github.com/grafana/loki/v3/pkg/util/ring"
+
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/backoff"
@@ -42,12 +49,9 @@ import (
 	"github.com/grafana/loki/v3/pkg/kafka"
 	"github.com/grafana/loki/v3/pkg/kafka/partition"
 	"github.com/grafana/loki/v3/pkg/kafka/partitionring"
-	"github.com/grafana/loki/v3/pkg/loghttp/push"
 	"github.com/grafana/loki/v3/pkg/logproto"
 	"github.com/grafana/loki/v3/pkg/logql"
-	lokilog "github.com/grafana/loki/v3/pkg/logql/log"
 	"github.com/grafana/loki/v3/pkg/logql/syntax"
-	"github.com/grafana/loki/v3/pkg/logqlmodel/metadata"
 	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
 	"github.com/grafana/loki/v3/pkg/querier/plan"
 	"github.com/grafana/loki/v3/pkg/runtime"
@@ -58,7 +62,6 @@ import (
 	indexstore "github.com/grafana/loki/v3/pkg/storage/stores/index"
 	"github.com/grafana/loki/v3/pkg/storage/stores/index/seriesvolume"
 	index_stats "github.com/grafana/loki/v3/pkg/storage/stores/index/stats"
-	"github.com/grafana/loki/v3/pkg/storage/types"
 	"github.com/grafana/loki/v3/pkg/util"
 	util_log "github.com/grafana/loki/v3/pkg/util/log"
 	server_util "github.com/grafana/loki/v3/pkg/util/server"
@@ -301,10 +304,30 @@ type Ingester struct {
 	ingestPartitionID       int32
 	partitionRingLifecycler *ring.PartitionInstanceLifecycler
 	partitionReader         *partition.ReaderService
+
+	bbfComputerClient *bbf.Pool
+	computerRing      *lokiring.RingManager
+	bbfConfig         bbf.Config
 }
 
 // New makes a new Ingester.
-func New(cfg Config, clientConfig client.Config, store Store, limits Limits, configs *runtime.TenantConfigs, registerer prometheus.Registerer, writeFailuresCfg writefailures.Cfg, metricsNamespace string, logger log.Logger, customStreamsTracker push.UsageTracker, readRing ring.ReadRing, partitionRingWatcher ring.PartitionRingReader) (*Ingester, error) {
+func New(
+	cfg Config,
+	clientConfig client.Config,
+	store Store,
+	limits Limits,
+	configs *runtime.TenantConfigs,
+	bbfConfig bbf.Config,
+	computerRing *lokiring.RingManager,
+	bbfComputerClient *bbf.Pool,
+	registerer prometheus.Registerer,
+	writeFailuresCfg writefailures.Cfg,
+	metricsNamespace string,
+	logger log.Logger,
+	customStreamsTracker push.UsageTracker,
+	readRing ring.ReadRing,
+	partitionRingWatcher ring.PartitionRingReader,
+) (*Ingester, error) {
 	if cfg.ingesterClientFactory == nil {
 		cfg.ingesterClientFactory = client.New
 	}
@@ -335,6 +358,9 @@ func New(cfg Config, clientConfig client.Config, store Store, limits Limits, con
 		writeLogManager:       writefailures.NewManager(logger, registerer, writeFailuresCfg, configs, "ingester"),
 		customStreamsTracker:  customStreamsTracker,
 		readRing:              readRing,
+		bbfComputerClient:     bbfComputerClient,
+		computerRing:          computerRing,
+		bbfConfig:             bbfConfig,
 	}
 	i.replayController = newReplayController(metrics, cfg.WAL, &replayFlusher{i})
 

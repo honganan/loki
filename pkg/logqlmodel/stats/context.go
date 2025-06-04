@@ -69,6 +69,9 @@ const (
 	BloomFilterCache          CacheType = "bloom-filter"          //nolint:staticcheck
 	BloomBlocksCache          CacheType = "bloom-blocks"          //nolint:staticcheck
 	BloomMetasCache           CacheType = "bloom-metas"           //nolint:staticcheck
+	BloomMemBlocksCache       CacheType = "bloom-memory-blocks"   //nolint:staticcheck
+	BBFIndexCache             CacheType = "bbf-index"             //nolint:staticcheck
+	BBFComputerCache          CacheType = "bbf-computer"          //nolint:staticcheck
 )
 
 // NewContext creates a new statistics context

@@ -30,6 +30,8 @@ import (
 	"github.com/grafana/dskit/server"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/user"
+	"github.com/grafana/loki/v3/pkg/bbf"
+	"github.com/grafana/loki/v3/pkg/bbf/computer"
 	gerrors "github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -160,6 +162,12 @@ const (
 	DataObjExplorer          = "dataobj-explorer"
 	DataObjConsumer          = "dataobj-consumer"
 	UI                       = "ui"
+	BBFStore                 = "bbf-store"
+	BloomQuerier             = "bloom-querier"
+	BBFIndex                 = "bbf-index"
+	BBFIndexRing             = "bbf-index-ring"
+	BBFComputer              = "bbf-computer"
+	BBFComputerRing          = "bbf-computer-ring"
 	All                      = "all"
 	Read                     = "read"
 	Write                    = "write"
@@ -170,6 +178,8 @@ const (
 	schedulerRingKey    = "scheduler"
 	indexGatewayRingKey = "index-gateway"
 	bloomGatewayRingKey = "bloom-gateway"
+	BBFIndexRingKey     = "bbf-index"
+	BBFComputerRingKey  = "bbf-computer"
 )
 
 func (t *Loki) initServer() (services.Service, error) {
@@ -779,7 +789,16 @@ func (t *Loki) initIngester() (_ services.Service, err error) {
 		level.Warn(util_log.Logger).Log("msg", "The config setting shutdown marker path is not set. The /ingester/prepare_shutdown endpoint won't work")
 	}
 
-	t.Ingester, err = ingester.New(t.Cfg.Ingester, t.Cfg.IngesterClient, t.Store, t.Overrides, t.tenantConfigs, prometheus.DefaultRegisterer, t.Cfg.Distributor.WriteFailuresLogging, t.Cfg.MetricsNamespace, logger, t.UsageTracker, t.ring, t.PartitionRingWatcher)
+	// bbf computer client pool
+	factory := t.Cfg.BBFConfig.Factory
+	if factory == nil {
+		factory = bbf.PoolAddrFunc(func(addr string) (bbf.PoolClient, error) {
+			return computer.NewClient(t.Cfg.BBFConfig.ClientConfig, addr)
+		})
+	}
+	pool := computer.NewComputerClientPool(BBFComputerRingKey, t.Cfg.BBFConfig.ClientConfig.PoolConfig, t.BBFComputerRingManager.Ring, factory, util_log.Logger, "computerclient")
+
+	t.Ingester, err = ingester.New(t.Cfg.Ingester, t.Cfg.IngesterClient, t.Store, t.Overrides, t.tenantConfigs, t.Cfg.BBFConfig, t.BBFComputerRingManager, pool, prometheus.DefaultRegisterer, t.Cfg.Distributor.WriteFailuresLogging, t.Cfg.MetricsNamespace, logger, t.UsageTracker, t.ring, t.PartitionRingWatcher)
 	if err != nil {
 		return
 	}
@@ -1142,6 +1161,7 @@ func (t *Loki) setupAsyncStore() error {
 
 		t.Cfg.StorageConfig.AsyncStoreConfig = storage.AsyncStoreCfg{
 			IngesterQuerier: t.ingesterQuerier,
+			BloomQuerier:    t.BloomQuerier,
 			QueryIngestersWithin: calculateAsyncStoreQueryIngestersWithin(
 				t.Cfg.Querier.QueryIngestersWithin,
 				minIngesterQueryStoreDuration,
@@ -1155,12 +1175,158 @@ func (t *Loki) setupAsyncStore() error {
 func (t *Loki) initIngesterQuerier() (_ services.Service, err error) {
 	logger := log.With(util_log.Logger, "component", "ingester-querier")
 
-	t.ingesterQuerier, err = querier.NewIngesterQuerier(t.Cfg.Querier, t.Cfg.IngesterClient, t.ring, t.partitionRing, t.Overrides.IngestionPartitionsTenantShardSize, t.Cfg.MetricsNamespace, logger)
+	t.ingesterQuerier, err = querier.NewIngesterQuerier(
+		t.Cfg.Querier,
+		t.Cfg.IngesterClient,
+		t.ring,
+		t.partitionRing,
+		t.Overrides.IngestionPartitionsTenantShardSize,
+		t.Cfg.MetricsNamespace,
+		logger,
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	return services.NewIdleService(nil, nil), nil
+}
+
+func (t *Loki) initBloomQuerier() (_ services.Service, err error) {
+	var (
+		logger       = log.With(util_log.Logger, "component", "bloom-querier")
+		bloomQuerier indexgateway.BloomQuerier
+	)
+	if t.Cfg.BBFConfig.QueryEnabled {
+		factory := t.Cfg.BBFConfig.Factory
+		if factory == nil {
+			factory = bbf.PoolAddrFunc(func(addr string) (bbf.PoolClient, error) {
+				return bbf.NewClient(t.Cfg.BBFConfig.ClientConfig, addr)
+			})
+		}
+		pool := bbf.NewBBFClientPool("bbf-index", t.Cfg.BBFConfig.ClientConfig.PoolConfig, t.BBFIndexRingManager.Ring, factory, logger, "index_gateway")
+		bloomQuerier = bbf.NewBBFQuerier(pool, t.BBFIndexRingManager.Ring, t.Cfg.BBFConfig, t.Cfg.SchemaConfig, logger)
+	}
+	t.BloomQuerier = bloomQuerier
+
+	return services.NewIdleService(nil, nil), nil
+}
+
+func (t *Loki) initBBFIndex() (services.Service, error) {
+	var err error
+	t.bbfIndex, err = bbf.NewBBFManger(t.Cfg.BBFConfig, t.Cfg.SchemaConfig.Configs, t.BBFStore, t.BBFIndexRingManager, prometheus.DefaultRegisterer, util_log.Logger)
+	if err != nil {
+		return nil, err
+	}
+
+	// 等 30 秒 ring 稳定后再启动 rpc server，防止计算 shard 不一致
+	//func() {
+	//	duration := 30 * time.Second
+	//	t := time.NewTimer(duration)
+	//	defer t.Stop()
+	//	level.Info(util_log.Logger).Log("msg", fmt.Sprintf("waiting %v for ring to stay stable before starting bbf-index", duration))
+	//	select {
+	//	case <-t.C:
+	//		level.Info(util_log.Logger).Log("msg", "bbf index startup delay completed")
+	//		break
+	//	}
+	//}()
+
+	bbf.RegisterBBFServer(t.Server.GRPC, t.bbfIndex)
+	httpMiddleware := middleware.Merge(
+		serverutil.RecoveryHTTPMiddleware,
+	)
+	t.Server.HTTP.Methods("GET", "POST").Path("/bbf_flush").Handler(
+		httpMiddleware.Wrap(http.HandlerFunc(t.bbfIndex.FlushHandler)),
+	)
+	t.Server.HTTP.Methods("GET", "POST").Path("/bbf_debug").Handler(
+		httpMiddleware.Wrap(http.HandlerFunc(t.bbfIndex.DebugHandler)),
+	)
+	t.Server.HTTP.Methods("GET", "POST").Path("/bbf_meta").Handler(
+		httpMiddleware.Wrap(http.HandlerFunc(t.bbfIndex.MetaHandler)),
+	)
+
+	return services.NewIdleService(nil, func(_ error) error {
+		t.bbfIndex.Close()
+		return nil
+	}), nil
+}
+
+func (t *Loki) initBBFIndexRingManager() (services.Service, error) {
+	// TODO(anan): 不太优雅，主要因为现在两个 ring 共用了一个 BBFConfig，没法在里面指定 ring 的 storePrefix
+	hostname, err := os.Hostname()
+	if err != nil {
+		level.Error(util_log.Logger).Log("msg", "failed to get hostname", "err", err)
+		os.Exit(1)
+	}
+	t.Cfg.BBFConfig.RingConfig.InstanceID = hostname
+	t.Cfg.BBFConfig.RingConfig.ListenPort = t.Cfg.Server.GRPCListenPort
+
+	managerMode := lokiring.ClientMode
+	if t.Cfg.isTarget(BBFIndex) {
+		managerMode = lokiring.ServerMode
+	}
+	rm, err := lokiring.NewRingManager(BBFIndexRingKey, managerMode, t.Cfg.BBFConfig.RingConfig, bbf.ReplicationFactor, bbf.NumTokens, util_log.Logger, prometheus.DefaultRegisterer)
+	if err != nil {
+		return nil, gerrors.Wrap(err, "new bbf index ring manager")
+	}
+	t.BBFIndexRingManager = rm
+
+	t.Server.HTTP.Path("/bbf-index/ring").Methods("GET", "POST").Handler(t.BBFIndexRingManager)
+
+	if t.Cfg.InternalServer.Enable {
+		t.InternalServer.HTTP.Path("/bbf-index/ring").Methods("GET", "POST").Handler(t.BBFIndexRingManager)
+	}
+	return t.BBFIndexRingManager, nil
+}
+
+func (t *Loki) initBBFComputer() (services.Service, error) {
+
+	bbfComputer, err := bbf.NewBBFComputer(t.BBFStore, t.Cfg.BBFConfig, t.Store.GetSchemaConfigs(), t.BBFIndexRingManager, prometheus.DefaultRegisterer, util_log.Logger)
+	if err != nil {
+		return nil, err
+	}
+	t.BBFComputer = bbfComputer
+
+	bbf.RegisterBBFComputerServer(t.Server.GRPC, t.BBFComputer)
+	return t.BBFComputer, nil
+}
+
+func (t *Loki) initBBFComputerRingManager() (services.Service, error) {
+	// TODO(anan): 不太优雅，主要因为现在两个 ring 共用了一个 BBFConfig，没法在里面指定 ring 的 storePrefix
+	hostname, err := os.Hostname()
+	if err != nil {
+		level.Error(util_log.Logger).Log("msg", "failed to get hostname", "err", err)
+		os.Exit(1)
+	}
+	t.Cfg.BBFConfig.RingConfig.InstanceID = hostname
+	t.Cfg.BBFConfig.RingConfig.ListenPort = t.Cfg.Server.GRPCListenPort
+
+	managerMode := lokiring.ClientMode
+	if t.Cfg.isTarget(BBFComputer) {
+		managerMode = lokiring.ServerMode
+	}
+	rm, err := lokiring.NewRingManager(BBFComputerRingKey, managerMode, t.Cfg.BBFConfig.RingConfig, bbf.ReplicationFactor, bbf.NumTokens, util_log.Logger, prometheus.DefaultRegisterer)
+	if err != nil {
+		return nil, gerrors.Wrap(err, "new bbf computing ring manager")
+	}
+	t.BBFComputerRingManager = rm
+
+	t.Server.HTTP.Path("/bbf-computer/ring").Methods("GET", "POST").Handler(t.BBFIndexRingManager)
+
+	if t.Cfg.InternalServer.Enable {
+		t.InternalServer.HTTP.Path("/bbf-computer/ring").Methods("GET", "POST").Handler(t.BBFIndexRingManager)
+	}
+	return t.BBFComputerRingManager, nil
+}
+
+func (t *Loki) initBBFStore() (services.Service, error) {
+	bbfStore := bbf.NewBBFStore(t.Store, t.Cfg.BBFConfig, t.Cfg.StorageConfig, t.ClientMetrics, prometheus.DefaultRegisterer, util_log.Logger, stats.BBFIndexCache)
+	t.BBFStore = bbfStore
+
+	return services.NewIdleService(nil, func(_ error) error {
+		t.BBFStore.Stop()
+		return nil
+	}), nil
 }
 
 // Placeholder limits type to pass to cortex frontend
@@ -1774,17 +1940,7 @@ func (t *Loki) initIndexGateway() (services.Service, error) {
 
 	logger := log.With(util_log.Logger, "component", "index-gateway")
 
-	var bloomQuerier indexgateway.BloomQuerier
-	if t.Cfg.BloomGateway.Enabled {
-		resolver := bloomgateway.NewBlockResolver(t.BloomStore, logger)
-		querierCfg := bloomgateway.QuerierConfig{
-			BuildTableOffset: t.Cfg.BloomBuild.Planner.MinTableOffset,
-			BuildInterval:    t.Cfg.BloomBuild.Planner.PlanningInterval,
-		}
-		bloomQuerier = bloomgateway.NewQuerier(t.bloomGatewayClient, querierCfg, t.Overrides, resolver, prometheus.DefaultRegisterer, logger)
-	}
-
-	gateway, err := indexgateway.NewIndexGateway(t.Cfg.IndexGateway, t.Overrides, logger, prometheus.DefaultRegisterer, t.Store, indexClients, bloomQuerier)
+	gateway, err := indexgateway.NewIndexGateway(t.Cfg.IndexGateway, t.Overrides, logger, prometheus.DefaultRegisterer, t.Store, indexClients, t.BloomQuerier)
 	if err != nil {
 		return nil, err
 	}

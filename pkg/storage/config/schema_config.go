@@ -14,7 +14,9 @@ import (
 
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/mtime"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
 	yaml "gopkg.in/yaml.v2"
 
 	"github.com/grafana/loki/v3/pkg/chunkenc"
@@ -145,9 +147,16 @@ type PeriodConfig struct {
 	IndexTables IndexPeriodicTableConfig `yaml:"index" doc:"description=Configures how the index is updated and stored."`
 	ChunkTables PeriodicTableConfig      `yaml:"chunks" doc:"description=Configured how the chunks are updated and stored."`
 	RowShards   uint32                   `yaml:"row_shards" doc:"default=16|description=How many shards will be created. Only used if schema is v10 or greater."`
+	BBFShards   int                      `yaml:"bbf_shards"`
+	BBFStreams  []BBFStreams             `yaml:"bbf_streams"`
 
 	// Integer representation of schema used for hot path calculation. Populated on unmarshaling.
 	schemaInt *int `yaml:"-"`
+}
+
+type BBFStreams struct {
+	Selector string            `yaml:"selector"`
+	Matchers []*labels.Matcher `yaml:"-"` // populated during validation.
 }
 
 // UnmarshalYAML implements yaml.Unmarshaller.
@@ -494,6 +503,16 @@ func (cfg PeriodConfig) validate() error {
 	default:
 		return errInvalidSchemaVersion
 	}
+
+	for i, c := range cfg.BBFStreams {
+		matchers, err := syntax.ParseMatchers(c.Selector, true)
+		if err != nil {
+			return fmt.Errorf("invalid labels matchers: %w", err)
+		}
+		// populate matchers during validation
+		cfg.BBFStreams[i].Matchers = matchers
+	}
+
 	return nil
 }
 

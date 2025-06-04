@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package bbf;
+import "pkg/logproto/logproto.proto";
+
+option go_package = "github.com/grafana/loki/v3/pkg/bbf";
+service BBF {
+  rpc Add(AddRequest) returns (AddResponse) {}
+  rpc BBFExists(BBFExistsRequest) returns (BBFExistsResponse) {}
+}
+
+message AddRequest {
+  map<int32, AddRecord> records = 1;
+}
+
+message AddRecord {
+  logproto.ChunkRef ref = 1;
+  int32 shard = 2;
+  repeated string values = 3;
+}
+
+message AddResponse {
+  bool added = 1;
+}
+
+message BBFExistsRequest {
+  string filter = 1;
+  string value = 2;
+  int32 shard = 3;
+  repeated logproto.ChunkRef refs = 4;
+}
+
+message BBFExistsResponse {
+  repeated bool exists = 1;
+}

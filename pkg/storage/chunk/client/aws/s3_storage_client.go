@@ -461,27 +461,47 @@ func (a *S3ObjectClient) GetObjectRange(ctx context.Context, objectKey string, o
 
 // PutObject into the store
 func (a *S3ObjectClient) PutObject(ctx context.Context, objectKey string, object io.Reader) error {
-	return loki_instrument.TimeRequest(ctx, "S3.PutObject", s3RequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
-		readSeeker, err := clientutil.ReadSeeker(object)
+	bkcfg := backoff.Config{
+		MinBackoff: 1 * time.Second,
+		MaxBackoff: 5 * time.Second,
+		MaxRetries: 3,
+	}
+	retries := backoff.New(ctx, bkcfg)
+	readSeeker, err := clientutil.ReadSeeker(object)
+	if err != nil {
+		return err
+	}
+
+	var lastErr error
+	for retries.Ongoing() {
+		_, err := readSeeker.Seek(0, io.SeekStart)
 		if err != nil {
 			return err
 		}
-		putObjectInput := &s3.PutObjectInput{
-			Body:         readSeeker,
-			Bucket:       aws.String(a.bucketFromKey(objectKey)),
-			Key:          aws.String(a.convertObjectKey(objectKey, true)),
-			StorageClass: aws.String(a.cfg.StorageClass),
-		}
+		lastErr = loki_instrument.TimeRequest(ctx, "S3.PutObject", s3RequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+			putObjectInput := &s3.PutObjectInput{
+				Body:         readSeeker,
+				Bucket:       aws.String(a.bucketFromKey(objectKey)),
+				Key:          aws.String(objectKey),
+				StorageClass: aws.String(a.cfg.StorageClass),
+			}
 
-		if a.sseConfig != nil {
-			putObjectInput.ServerSideEncryption = aws.String(a.sseConfig.ServerSideEncryption)
-			putObjectInput.SSEKMSKeyId = a.sseConfig.KMSKeyID
-			putObjectInput.SSEKMSEncryptionContext = a.sseConfig.KMSEncryptionContext
-		}
+			if a.sseConfig != nil {
+				putObjectInput.ServerSideEncryption = aws.String(a.sseConfig.ServerSideEncryption)
+				putObjectInput.SSEKMSKeyId = a.sseConfig.KMSKeyID
+				putObjectInput.SSEKMSEncryptionContext = a.sseConfig.KMSEncryptionContext
+			}
 
-		_, err = a.S3.PutObjectWithContext(ctx, putObjectInput)
-		return err
-	})
+			_, err := a.S3.PutObjectWithContext(ctx, putObjectInput)
+			return err
+		})
+		if lastErr == nil {
+			return nil
+		}
+		retries.Wait()
+	}
+
+	return lastErr
 }
 
 // List implements chunk.ObjectClient.

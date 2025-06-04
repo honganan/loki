@@ -6,11 +6,12 @@ import (
 	"time"
 
 	"github.com/c2h5oh/datasize"
+	"github.com/grafana/loki/v3/pkg/indexgateway"
+	"github.com/grafana/loki/v3/pkg/logproto"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/grafana/loki/v3/pkg/logproto"
 	"github.com/grafana/loki/v3/pkg/storage/stores"
 	"github.com/grafana/loki/v3/pkg/storage/stores/index/seriesvolume"
 	"github.com/grafana/loki/v3/pkg/storage/stores/shipper/indexshipper/tsdb/sharding"
@@ -39,6 +40,7 @@ type AsyncStoreCfg struct {
 	IngesterQuerier IngesterQuerier
 	// QueryIngestersWithin defines maximum lookback beyond which ingesters are not queried for chunk ids.
 	QueryIngestersWithin time.Duration
+	BloomQuerier         indexgateway.BloomQuerier
 }
 
 // AsyncStore does querying to both ingesters and chunk store and combines the results after deduping them.
@@ -50,6 +52,7 @@ type AsyncStore struct {
 	scfg                 config.SchemaConfig
 	ingesterQuerier      IngesterQuerier
 	queryIngestersWithin time.Duration
+	BloomQuerier         indexgateway.BloomQuerier
 }
 
 func NewAsyncStore(cfg AsyncStoreCfg, store stores.Store, scfg config.SchemaConfig) *AsyncStore {
@@ -58,6 +61,7 @@ func NewAsyncStore(cfg AsyncStoreCfg, store stores.Store, scfg config.SchemaConf
 		scfg:                 scfg,
 		ingesterQuerier:      cfg.IngesterQuerier,
 		queryIngestersWithin: cfg.QueryIngestersWithin,
+		BloomQuerier:         cfg.BloomQuerier,
 	}
 }
 
@@ -85,7 +89,7 @@ func (a *AsyncStore) GetChunks(ctx context.Context,
 		return err
 	})
 
-	var ingesterChunks []string
+	var chunkRefs []*logproto.ChunkRef
 
 	g.Go(func() error {
 		if !a.shouldQueryIngesters(through, model.Now()) {
@@ -93,14 +97,26 @@ func (a *AsyncStore) GetChunks(ctx context.Context,
 			return nil
 		}
 
-		var err error
-		ingesterChunks, err = a.ingesterQuerier.GetChunkIDs(ctx, from, through, predicate.Matchers...)
-
+		ingesterChunks, err := a.ingesterQuerier.GetChunkIDs(ctx, from, through, predicate.Matchers...)
 		if err == nil {
 			sp := trace.SpanFromContext(ctx)
 			sp.SetAttributes(attribute.Int("ingester-chunks-count", len(ingesterChunks)))
 
 			level.Debug(util_log.Logger).Log("msg", "got chunk ids from ingester", "count", len(ingesterChunks))
+		} else {
+			return err
+		}
+		chks, err := a.parseChunkIDs(userID, ingesterChunks)
+		if err != nil {
+			return err
+		}
+		if len(ingesterChunks) == 0 || a.BloomQuerier == nil || len(syntax.ExtractLineFilters(predicate.Plan().AST)) == 0 {
+			chunkRefs = refsFromChunks(chks)
+			return nil
+		}
+		chunkRefs, _, err = a.BloomQuerier.FilterChunkRefs(ctx, userID, from, through, nil, refsFromChunks(chks), predicate.Plan())
+		if err == nil {
+			level.Debug(util_log.Logger).Log("msg", "filtered chunk ids from ingester", "before", len(chks), "after", len(chunkRefs))
 		}
 		return err
 	})
@@ -109,11 +125,11 @@ func (a *AsyncStore) GetChunks(ctx context.Context,
 		return nil, nil, err
 	}
 
-	if len(ingesterChunks) == 0 {
+	if len(chunkRefs) == 0 {
 		return storeChunks, fetchers, nil
 	}
 
-	return a.mergeIngesterAndStoreChunks(userID, storeChunks, fetchers, ingesterChunks)
+	return a.mergeIngesterAndStoreChunks(storeChunks, fetchers, chunkRefs)
 }
 
 func (a *AsyncStore) Stats(ctx context.Context, userID string, from, through model.Time, matchers ...*labels.Matcher) (*stats.Stats, error) {
@@ -228,9 +244,31 @@ func (a *AsyncStore) Volume(ctx context.Context, userID string, from, through mo
 	return merged, nil
 }
 
-func (a *AsyncStore) mergeIngesterAndStoreChunks(userID string, storeChunks [][]chunk.Chunk, fetchers []*fetcher.Fetcher, ingesterChunkIDs []string) ([][]chunk.Chunk, []*fetcher.Fetcher, error) {
-	ingesterChunkIDs = filterDuplicateChunks(a.scfg, storeChunks, ingesterChunkIDs)
-	level.Debug(util_log.Logger).Log("msg", "post-filtering ingester chunks", "count", len(ingesterChunkIDs))
+func (a *AsyncStore) parseChunkIDs(userID string, ids []string) ([]chunk.Chunk, error) {
+	chunks := make([]chunk.Chunk, 0, len(ids))
+	for _, id := range ids {
+		chk, err := chunk.ParseExternalKey(userID, id)
+		if err != nil {
+			level.Error(util_log.Logger).Log("msg", "failed to parse chunk id", "chunk_id", id, "err", err)
+			return nil, err
+		}
+		chunks = append(chunks, chk)
+	}
+	return chunks, nil
+}
+
+func refsFromChunks(chunks []chunk.Chunk) []*logproto.ChunkRef {
+	chunkRefs := make([]*logproto.ChunkRef, 0, len(chunks))
+	for _, chk := range chunks {
+		chunkRef := chk.ChunkRef
+		chunkRefs = append(chunkRefs, &chunkRef)
+	}
+	return chunkRefs
+}
+
+func (a *AsyncStore) mergeIngesterAndStoreChunks(storeChunks [][]chunk.Chunk, fetchers []*fetcher.Fetcher, ingesterChunks []*logproto.ChunkRef) ([][]chunk.Chunk, []*fetcher.Fetcher, error) {
+	ingesterChunks = filterDuplicateChunks(a.scfg, storeChunks, ingesterChunks)
+	level.Debug(util_log.Logger).Log("msg", "post-filtering ingester chunks", "count", len(ingesterChunks))
 
 	fetcherToChunksGroupIdx := make(map[*fetcher.Fetcher]int, len(fetchers))
 
@@ -238,16 +276,12 @@ func (a *AsyncStore) mergeIngesterAndStoreChunks(userID string, storeChunks [][]
 		fetcherToChunksGroupIdx[fetcher] = i
 	}
 
-	for _, chunkID := range ingesterChunkIDs {
-		chk, err := chunk.ParseExternalKey(userID, chunkID)
-		if err != nil {
-			return nil, nil, err
-		}
+	for _, chk := range ingesterChunks {
 
 		// ToDo(Sandeep) possible optimization: Keep the chunk fetcher reference handy after first call since it is expected to stay the same.
 		fetcher := a.Store.GetChunkFetcher(chk.Through)
 		if fetcher == nil {
-			return nil, nil, fmt.Errorf("got a nil fetcher for chunk %s", a.scfg.ExternalKey(chk.ChunkRef))
+			return nil, nil, fmt.Errorf("got a nil fetcher for chunk %s", a.scfg.ExternalKey(*chk))
 		}
 
 		if _, ok := fetcherToChunksGroupIdx[fetcher]; !ok {
@@ -257,14 +291,14 @@ func (a *AsyncStore) mergeIngesterAndStoreChunks(userID string, storeChunks [][]
 		}
 		chunksGroupIdx := fetcherToChunksGroupIdx[fetcher]
 
-		storeChunks[chunksGroupIdx] = append(storeChunks[chunksGroupIdx], chk)
+		storeChunks[chunksGroupIdx] = append(storeChunks[chunksGroupIdx], chunk.Chunk{ChunkRef: *chk})
 	}
 
 	return storeChunks, fetchers, nil
 }
 
-func filterDuplicateChunks(scfg config.SchemaConfig, storeChunks [][]chunk.Chunk, ingesterChunkIDs []string) []string {
-	filteredChunkIDs := make([]string, 0, len(ingesterChunkIDs))
+func filterDuplicateChunks(scfg config.SchemaConfig, storeChunks [][]chunk.Chunk, ingesterChunks []*logproto.ChunkRef) []*logproto.ChunkRef {
+	filteredChunks := make([]*logproto.ChunkRef, 0, len(ingesterChunks))
 	seen := make(map[string]struct{}, len(storeChunks))
 
 	for i := range storeChunks {
@@ -273,14 +307,15 @@ func filterDuplicateChunks(scfg config.SchemaConfig, storeChunks [][]chunk.Chunk
 		}
 	}
 
-	for _, chunkID := range ingesterChunkIDs {
-		if _, ok := seen[chunkID]; !ok {
-			filteredChunkIDs = append(filteredChunkIDs, chunkID)
-			seen[chunkID] = struct{}{}
+	for _, chk := range ingesterChunks {
+		chkId := scfg.ExternalKey(*chk)
+		if _, ok := seen[chkId]; !ok {
+			filteredChunks = append(filteredChunks, chk)
+			seen[chkId] = struct{}{}
 		}
 	}
 
-	return filteredChunkIDs
+	return filteredChunks
 }
 
 func (a *AsyncStore) GetShards(
@@ -339,7 +374,10 @@ func mergeShardsFromIngestersAndStore(
 	statsResp *logproto.IndexStatsResponse,
 	targetBytesPerShard uint64,
 ) *logproto.ShardsResponse {
-	var storeBytes uint64
+	var (
+		storeBytes uint64
+		shards     []logproto.Shard
+	)
 	for _, shard := range storeResp.Shards {
 		storeBytes += shard.Stats.Bytes
 	}
@@ -353,27 +391,32 @@ func mergeShardsFromIngestersAndStore(
 			"total_bytes", datasize.ByteSize(totalBytes).HumanReadable(),
 			"target_bytes", datasize.ByteSize(targetBytesPerShard).HumanReadable(),
 			"store_shards", len(storeResp.Shards),
+			"total_shards", len(shards),
 		)
 	}()
 
 	// edge case to avoid divide by zero later
 	if totalBytes == 0 {
+		shards = sharding.LinearShards(0, 0)
 		return &logproto.ShardsResponse{
-			Shards: sharding.LinearShards(0, 0),
+			Shards: shards,
 		}
 	}
 
 	// If the ingesters don't have enough data to meaningfuly
 	// change the number of shards, use the store response.
 	if pct := float64(statsResp.Bytes) / float64(totalBytes); pct < 0.25 {
+		shards = storeResp.Shards
 		return storeResp
 	}
 
-	shards := sharding.LinearShards(int(totalBytes/targetBytesPerShard), totalBytes)
+	shards = sharding.LinearShards(int(totalBytes/targetBytesPerShard), totalBytes)
 
 	return &logproto.ShardsResponse{
 		Shards: shards,
 		// explicitly nil chunkgroups when we've changed the shards+included chunkrefs from ingesters
+		// TODO anan: 当开启 precompute 时不需要返回 ChunkIDs?
+		// TODO anan: 查询时有时无和 AsyncStore 下沉有没有关系? 可以本地 debug 一下
 		ChunkGroups: nil,
 	}
 }

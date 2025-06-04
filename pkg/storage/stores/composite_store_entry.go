@@ -65,9 +65,11 @@ func (c *storeEntry) GetChunks(
 		return nil, nil, nil
 	}
 
+	level.Info(util_log.Logger).Log("storeChunksOverride is nil", storeChunksOverride == nil)
 	var refs []*logproto.ChunkRef
 	if storeChunksOverride != nil {
 		refs = storeChunksOverride.Refs
+		level.Info(util_log.Logger).Log("storeChunksOverride.Refs", len(refs))
 	} else {
 		// TODO(owen-d): fix needless O(n) conversions that stem from difference in store impls (value)
 		// vs proto impls (reference)

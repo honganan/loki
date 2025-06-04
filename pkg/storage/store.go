@@ -498,6 +498,7 @@ func (s *LokiStore) SelectLogs(ctx context.Context, req logql.SelectLogParams) (
 	if err != nil {
 		return nil, err
 	}
+	level.Info(s.logger).Log("msg", "got lazy chunks", "count", len(lazyChunks))
 
 	if len(lazyChunks) == 0 {
 		return iter.NoopEntryIterator, nil

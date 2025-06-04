@@ -24,6 +24,7 @@ import (
 	"github.com/grafana/dskit/server"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/signals"
+	"github.com/grafana/loki/v3/pkg/bbf"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
@@ -132,7 +133,8 @@ type Config struct {
 
 	ShutdownDelay time.Duration `yaml:"shutdown_delay"`
 
-	MetricsNamespace string `yaml:"metrics_namespace"`
+	MetricsNamespace string     `yaml:"metrics_namespace"`
+	BBFConfig        bbf.Config `yaml:"bbf_config,omitempty"`
 }
 
 // RegisterFlags registers flag.
@@ -215,6 +217,7 @@ func (c *Config) registerServerFlagsWithChangedDefaultValues(fs *flag.FlagSet) {
 	c.Server.RegisterFlags(throwaway)
 	c.InternalServer.RegisterFlags(throwaway)
 	c.Pattern.RegisterFlags(throwaway)
+	c.BBFConfig.RegisterFlagsWithPrefix(throwaway)
 
 	throwaway.VisitAll(func(f *flag.Flag) {
 		// Ignore errors when setting new values. We have a test to verify that it works.
@@ -431,9 +434,16 @@ type Loki struct {
 	ClientMetrics       storage.ClientMetrics
 	deleteClientMetrics *deletion.DeleteRequestClientMetrics
 
-	Tee                distributor.Tee
-	PushParserWrapper  push.RequestParserWrapper
-	HTTPAuthMiddleware middleware.Interface
+	Tee                    distributor.Tee
+	PushParserWrapper      push.RequestParserWrapper
+	HTTPAuthMiddleware     middleware.Interface
+	bbfIndex               *bbf.BBFManager
+	BBFIndexRingManager    *lokiring.RingManager
+	BBFComputer            *bbf.BBFComputer
+	BBFComputerRingManager *lokiring.RingManager
+	BBFComputerClient      *bbf.Pool
+	BBFStore               *bbf.BBFStore
+	BloomQuerier           indexgateway.BloomQuerier
 
 	Codec   Codec
 	Metrics *server.Metrics
@@ -768,6 +778,12 @@ func (t *Loki) setupModuleManager() error {
 	mm.RegisterModule(DataObjExplorer, t.initDataObjExplorer)
 	mm.RegisterModule(UI, t.initUI)
 	mm.RegisterModule(DataObjConsumer, t.initDataObjConsumer)
+	mm.RegisterModule(BBFIndex, t.initBBFIndex)
+	mm.RegisterModule(BBFIndexRing, t.initBBFIndexRingManager)
+	mm.RegisterModule(BBFComputer, t.initBBFComputer, modules.UserInvisibleModule)
+	mm.RegisterModule(BBFComputerRing, t.initBBFComputerRingManager, modules.UserInvisibleModule)
+	mm.RegisterModule(BBFStore, t.initBBFStore, modules.UserInvisibleModule)
+	mm.RegisterModule(BloomQuerier, t.initBloomQuerier, modules.UserInvisibleModule)
 
 	mm.RegisterModule(All, nil)
 	mm.RegisterModule(Read, nil)
@@ -787,8 +803,8 @@ func (t *Loki) setupModuleManager() error {
 		IngestLimits:             {MemberlistKV, Overrides, Server},
 		IngestLimitsFrontend:     {IngestLimitsRing, Overrides, Server, MemberlistKV},
 		IngestLimitsFrontendRing: {RuntimeConfig, Server, MemberlistKV},
-		Store:                    {Overrides, IndexGatewayRing},
-		Ingester:                 {Store, Server, MemberlistKV, TenantConfigs, Analytics, PartitionRing, UI},
+		Store:                    {Overrides, IndexGatewayRing, BloomQuerier},
+		Ingester:                 {Store, Server, BBFComputerRing, MemberlistKV, TenantConfigs, Analytics, PartitionRing, UI},
 		Querier:                  {Store, Ring, Server, IngesterQuerier, PatternRingClient, Overrides, Analytics, CacheGenerationLoader, QuerySchedulerRing, UI},
 		QueryFrontendTripperware: {Server, Overrides, TenantConfigs},
 		QueryFrontend:            {QueryFrontendTripperware, Analytics, CacheGenerationLoader, QuerySchedulerRing, UI},
@@ -797,7 +813,7 @@ func (t *Loki) setupModuleManager() error {
 		RuleEvaluator:            {Ring, Server, Store, IngesterQuerier, Overrides, TenantConfigs, Analytics},
 		TableManager:             {Server, Analytics, UI},
 		Compactor:                {Server, Overrides, MemberlistKV, Analytics, UI},
-		IndexGateway:             {Server, Store, BloomStore, IndexGatewayRing, IndexGatewayInterceptors, Analytics, UI},
+		IndexGateway:             {Server, Store, BloomStore, BloomQuerier, IndexGatewayRing, IndexGatewayInterceptors, Analytics, UI},
 		BloomGateway:             {Server, BloomStore, Analytics, UI},
 		BloomPlanner:             {Server, BloomStore, Analytics, Store, UI},
 		BloomBuilder:             {Server, BloomStore, Analytics, Store, UI},
@@ -814,6 +830,12 @@ func (t *Loki) setupModuleManager() error {
 		BlockScheduler:           {Server, UI},
 		DataObjExplorer:          {Server, UI},
 		DataObjConsumer:          {PartitionRing, Server, UI},
+		BBFStore:                 {Store},
+		BBFIndex:                 {Server, BBFStore, BBFIndexRing},
+		BBFIndexRing:             {Server, MemberlistKV, Analytics},
+		BBFComputer:              {Server, BBFStore, Store, BBFIndexRing, BBFComputerRing},
+		BBFComputerRing:          {Server, MemberlistKV, Analytics},
+		BloomQuerier:             {BBFIndexRing},
 
 		Read:    {QueryFrontend, Querier},
 		Write:   {Ingester, Distributor, PatternIngester},
